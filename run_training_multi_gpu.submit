@@ -1,0 +1,64 @@
+#!/bin/bash
+#SBATCH --time=24:00:00
+#SBATCH --job-name=lerobot_finetuning
+#SBATCH --ntasks=1
+#SBATCH --nodes=1
+#SBATCH --cpus-per-task=32
+#SBATCH --gres=gpu:h200sxm:2
+#SBATCH --mem=200G
+#SBATCH --account=cai_cv
+#SBATCH --partition=gpu_top
+#SBATCH --output=/cluster/home/%u/.logs/slurm/LeRobot_%j_%N.out
+#SBATCH --error=/cluster/home/%u/.logs/slurm/LeRobot_%j_%N.err
+
+
+export BASE_SCRATCH="/scratch"
+export HF_HOME="$BASE_SCRATCH/hf_cache"
+export WANDB_DIR="$BASE_SCRATCH/wandb"
+export UV_CACHE_DIR="$BASE_SCRATCH/uv_cache_shared"
+export WANDB_CACHE_DIR="$BASE_SCRATCH/wandb/.cache"
+export WANDB_DATA_DIR="$BASE_SCRATCH/data"
+
+# Define a disposable environment name based on the Job ID
+export JOB_VENV="$BASE_SCRATCH/venvs/job_$SLURM_JOB_ID"
+
+# Optimizations
+export OMP_NUM_THREADS=8
+export MKL_NUM_THREADS=8
+
+echo "--- SETUP: Creating Ephemeral Environment in /scratch ---"
+echo "Venv Location: $JOB_VENV"
+
+module load python/3.11
+module load uv/0.6.12
+
+# Create the venv on fast disk
+uv venv "$JOB_VENV"
+uv pip install -p "$JOB_VENV/bin/python" -e ".[smolvla,pi]"
+uv pip install -p "$JOB_VENV/bin/python" accelerate
+
+# Auto-detect number of GPUs provided by Slurm
+NUM_GPUS=$(nvidia-smi --query-gpu=name --format=csv,noheader | wc -l)
+
+# Fallback: If nvidia-smi fails (rare), try counting commas in CUDA_VISIBLE_DEVICES
+if [ -z "$NUM_GPUS" ] || [ "$NUM_GPUS" -eq 0 ]; then
+    NUM_GPUS=$(echo $CUDA_VISIBLE_DEVICES | tr ',' '\n' | wc -l)
+fi
+
+# Final Safety Net: Default to 1 if both fail (avoids crashing accelerate)
+if [ -z "$NUM_GPUS" ] || [ "$NUM_GPUS" -eq 0 ]; then
+    NUM_GPUS=1
+fi
+
+echo "Launching on $NUM_GPUS GPUs..."
+
+# We run 'accelerate.commands.launch' as a module.
+"$JOB_VENV/bin/python" -u -m accelerate.commands.launch \
+    --num_processes=$NUM_GPUS \
+    --mixed_precision=bf16 \
+    --dynamo_backend=no \
+  src/lerobot/scripts/lerobot_train.py \
+    --output_dir="$BASE_SCRATCH/outputs/pi05_training_${SLURM_JOB_ID}" \
+    --job_name="pi05_${SLURM_JOB_ID}" \
+    "$@"
+
